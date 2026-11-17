@@ -924,7 +924,13 @@ has 124 programs (agents, editors, runtimes, tools, databases, infra);
   `<worktrees.directory>/<repo>/<branch>` on the space's machine (default
   `~/.herdr/worktrees`; see settings.json above); the
   `spaces` sidebar nests worktree spaces under their repo's and shows each
-  space's repo, branch, ahead/behind and uncommitted changes). Shipped mods
+  space's repo, branch, ahead/behind and uncommitted changes). To react
+  when the dialog makes or removes a checkout, read shared
+  `"worktree.events"` in `render()`: its last 20 changes, oldest first, each
+  `{seq, type: "created" | "removed", repo, path, branch, machine}`, kept
+  across restarts (remember the last `seq` you handled). `created` comes
+  before its space opens; `removed` after the space closes and the folder is
+  gone. Checkouts made or removed outside the dialog aren't in it. Shipped mods
   are Herdr's; duplicate with `mod.clone` before editing.
 
 ### Check before you finish

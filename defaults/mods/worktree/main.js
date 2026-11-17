@@ -3,7 +3,7 @@
 
 import { View, div } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, Scrollbar } from "gpui-base";
-import { run, props, closeOverlay, theme, spaces, panes, exec, home, appHome, readTextFile } from "herdr";
+import { run, props, closeOverlay, theme, spaces, panes, exec, home, appHome, readTextFile, shared, setShared } from "herdr";
 
 // Where a space is now: its first terminal's live folder, else where it was made.
 function place(s, all = panes()) {
@@ -67,6 +67,13 @@ function spaceOf(path, all, on, spaceList, paneList) {
     if (!at || !inside(at, path)) return false;
     return !all.some((c) => c.path !== path && c.path.length > path.length && inside(at, c.path));
   })());
+}
+
+// Other mods follow worktrees made and removed here through shared "worktree.events":
+// the last 20, oldest first, each { seq, type: "created" | "removed", repo, path, branch, machine }.
+function publish(event) {
+  const log = (shared("worktree.events") ?? []).slice(-19);
+  setShared("worktree.events", [...log, { seq: (log.at(-1)?.seq ?? 0) + 1, ...event }]);
 }
 
 async function git(cwd, args, on, timeout) {
@@ -206,6 +213,7 @@ export default class Worktree extends View {
     const add = exists ? ["worktree", "add", path, branch] : ["worktree", "add", "-b", branch, path, "HEAD"];
     const r = await git(this.repo.top, add, this.on, 600_000);
     if (!r.ok) return r.err || "git worktree add failed.";
+    publish({ type: "created", repo: this.repo.main, path, branch, machine: this.on ?? null });
     const p = props();
     // Leave spaces unnamed so they follow the checkout folder and nest under the repo.
     run("space.new", { folder: path, machine: this.on ?? "", tab: p.tab, argv: p.argv });
@@ -237,11 +245,14 @@ export default class Worktree extends View {
     this.dirty ||= status.out !== "";
     this.unpushed = [...new Set([...this.unpushed, ...unpushed])];
     if (changed) return "It changed since this opened. Enter again removes it anyway.";
+    const branch = await git(this.repo.top, ["symbolic-ref", "--quiet", "--short", "HEAD"], this.on);
     // Terminals first: a shell sitting in the folder keeps it busy on Windows.
     run("space.close", { id: s.id, confirmed: true });
     const force = this.dirty || mods.length > 0;
     const r = await git(this.repo.main, ["worktree", "remove", ...(force ? ["--force"] : []), this.repo.top], this.on, 600_000);
-    return r.ok ? "" : r.err || "git worktree remove failed.";
+    if (!r.ok) return r.err || "git worktree remove failed.";
+    publish({ type: "removed", repo: this.repo.main, path: this.repo.top, branch: branch.ok ? branch.out : null, machine: this.on ?? null });
+    return "";
   }
 
   key(e, cx) {

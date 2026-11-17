@@ -179,6 +179,42 @@ fn fixture(populated: bool, props: Value, update: Value) -> BTreeMap<String, Val
     values
 }
 
+fn fixture_git(args: &Value) -> Option<Value> {
+    [
+        json!(["rev-parse", "--show-toplevel"]),
+        json!(["rev-parse", "--path-format=absolute", "--git-common-dir"]),
+        json!(["status", "--porcelain=v2", "--branch"]),
+        json!(["--no-optional-locks", "-c", "core.fsmonitor=false", "status", "--porcelain=v2", "--branch"]),
+        json!(["--no-optional-locks", "-c", "core.fsmonitor=false", "status", "--porcelain"]),
+        json!(["rev-parse", "--abbrev-ref", "HEAD"]),
+    ]
+    .contains(args)
+    .then(|| json!({"code":128,"stdout":"","stderr":"fixture: not a git repository"}))
+}
+
+// A repo at /fixture/repo with one linked worktree, feat/x, and no submodules.
+fn worktree_git(args: &Value, options: &Value) -> Option<Value> {
+    const MAIN: &str = "/fixture/repo";
+    const LINKED: &str = "/fixture/.herdr/worktrees/repo/feat-x";
+    let cwd = options.get("cwd").and_then(Value::as_str)?;
+    let top = [MAIN, LINKED].into_iter().find(|top| cwd.starts_with(top))?;
+    let args: Vec<&str> = args.as_array()?.iter().filter_map(Value::as_str).collect();
+    let ok = |stdout: &str| Some(json!({"code":0,"stdout":stdout,"stderr":""}));
+    let no = || Some(json!({"code":1,"stdout":"","stderr":""}));
+    match args.as_slice() {
+        ["rev-parse", "--show-toplevel"] => ok(top),
+        ["rev-parse", "--path-format=absolute", "--git-common-dir"] => ok("/fixture/repo/.git"),
+        ["rev-parse", "--absolute-git-dir"] => ok("/fixture/repo/.git/worktrees/feat-x"),
+        ["--no-optional-locks", "-c", "core.fsmonitor=false", "status", "--porcelain"] => ok(""),
+        ["symbolic-ref", "--quiet", "--short", "HEAD"] => ok(if top == LINKED { "feat/x" } else { "main" }),
+        ["show-ref", "--verify", "--quiet", _] => no(),
+        ["--git-dir", _, "config", ..] => no(),
+        ["worktree", "add", "-b", "feat/x", LINKED, "HEAD"] => ok(""),
+        ["worktree", "remove", LINKED] => ok(""),
+        _ => None,
+    }
+}
+
 fn module(values: BTreeMap<String, Value>, calls: Rc<RefCell<Calls>>) -> HostModule {
     let mut module = HostModule::new("herdr");
     for (name, value) in values {
@@ -244,23 +280,10 @@ fn module(values: BTreeMap<String, Value>, calls: Rc<RefCell<Calls>>) -> HostMod
                 "hc" if first == json!(["machine", "add", "host", "--json"]) => {
                     Some(json!({"code":1,"stdout":"{\"error\":{\"kind\":\"host_key\",\"message\":\"unknown host key\"}}","stderr":""}))
                 }
+                "exec" if first == "git" => worktree_git(&a.get(1).map(from_host).unwrap_or(Value::Null), &a.get(2).map(from_host).unwrap_or(Value::Null)).or_else(|| fixture_git(&a.get(1).map(from_host).unwrap_or(Value::Null))),
                 // The files panel lists a folder with sh: kind and name pairs.
                 "exec" if first == "sh" && a.get(1).map(from_host).and_then(|v| v.get(2).cloned()) == Some(json!("files")) => {
                     Some(json!({"code":0,"stdout":"d\u{0}src\u{0}f\u{0}README.md\u{0}","stderr":""}))
-                }
-                "exec"
-                    if first == "git"
-                        && [
-                            json!(["rev-parse", "--show-toplevel"]),
-                            json!(["rev-parse", "--path-format=absolute", "--git-common-dir"]),
-                            json!(["status", "--porcelain=v2", "--branch"]),
-                            json!(["--no-optional-locks", "-c", "core.fsmonitor=false", "status", "--porcelain=v2", "--branch"]),
-                            json!(["--no-optional-locks", "-c", "core.fsmonitor=false", "status", "--porcelain"]),
-                            json!(["rev-parse", "--abbrev-ref", "HEAD"]),
-                        ]
-                        .contains(&a.get(1).map(from_host).unwrap_or(Value::Null)) =>
-                {
-                    Some(json!({"code":128,"stdout":"","stderr":"fixture: not a git repository"}))
                 }
                 _ => None,
             };
@@ -836,6 +859,42 @@ fn machine_picker_keeps_long_lists_scrollable(cx: &mut TestAppContext) {
     assert!(scroll.contains(".min_h[Number(0.0)]"), "{tree}");
     assert!(tree.contains("ma-row-host-29"), "{tree}");
     assert_eq!(tree.matches(".flex_none").count(), 60, "rows must not shrink into the viewport: {tree}");
+}
+
+#[gpui::test]
+fn worktree_tells_other_mods_what_it_created_and_removed(cx: &mut TestAppContext) {
+    cx.update(gpui_shell::init);
+    let staged = Staged::new();
+    let calls = Rc::new(RefCell::new(Calls::default()));
+    let window = cx.add_window(|_, _| Empty);
+    let scenarios = [
+        (json!({"overlay":"o1","folder":"/fixture/repo","branch":"feat/x","action":"new"}), ""),
+        // Presses Enter once the dialog has read the repo, as a person would.
+        (
+            json!({"overlay":"o1","space":"s1","folder":"/fixture/.herdr/worktrees/repo/feat-x","action":"remove"}),
+            "let repo; Object.defineProperty(this, 'repo', { get: () => repo, set: (v) => { repo = v; if (v) this.go(cx); } });",
+        ),
+    ];
+    for (props, setup) in scenarios {
+        let policy = Policy::new()
+            .with_host_module(module(fixture(true, props, updates("current", "current")), calls.clone()))
+            .unwrap();
+        let root = staged.wrapper("mods/worktree", setup);
+        let _session = window.update(cx, |_, window, cx| {
+            DescriptionSession::load(ShellRuntime::new_isolated().unwrap(), root, policy, window, cx).unwrap()
+        }).unwrap();
+        cx.run_until_parked();
+    }
+    window.update(cx, |_, window, _| window.remove_window()).unwrap();
+    let calls = calls.borrow();
+    assert!(calls.unexpected.is_empty(), "{:?}", calls.unexpected);
+    assert_eq!(
+        calls.shared.get("worktree.events"),
+        Some(&json!([
+            {"seq":1,"type":"created","repo":"/fixture/repo","path":"/fixture/.herdr/worktrees/repo/feat-x","branch":"feat/x","machine":null},
+            {"seq":2,"type":"removed","repo":"/fixture/repo","path":"/fixture/.herdr/worktrees/repo/feat-x","branch":"feat/x","machine":null},
+        ])),
+    );
 }
 
 #[gpui::test]
